@@ -1,26 +1,29 @@
 #include <cstdlib>
 #include <cinttypes>
 #include <iostream>
-#include <iomanip>
-#include <sstream>
 #include <string>
 #include <cstring>
 #include <vector>
 
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 
 #include "ANSI.hpp"
+
+//#define DEBUG_INPUT
+//#define DEBUG_WORDS
+//#define DEBUG_EXECUTE
 
 // Строки-разделители для непривилегированного и привилигерованнонного пользователя.
 const std::string up_delimeter = " ☭ ";
 const std::string p_delimeter  = "! ";
 
 // Копирующая вариация dup2.
-int copy_dup2(int oldfd, int newfd)
+inline int copy_dup2(int oldfd, int newfd)
 {
-    int copy = dup(oldfd);
+    int copy = dup(newfd);
     if (copy == -1) { return -1; }
     if (dup2(oldfd, newfd) == -1) { return -1; }
     return copy;
@@ -39,13 +42,17 @@ enum class ExecutionException
 };
 
 // Запуск исполняемого файла по указанному пути с переопределением ввода и вывода.
-void execute(const std::string& path, const std::vector<std::string>& args, int input_fd, int output_fd)
+pid_t execute(const std::string& path, const std::vector<std::string>& args, int input_fd, int output_fd, int close_fd = -1)
 {
+    #ifdef DEBUG_EXECUTE
+    std::cout << "Ввод: " << input_fd << std::endl << "Вывод: " << output_fd << std::endl;
+    #endif
+
     // Сохранение текущих файловых дескрипторов ввода и вывода.
     int prev_input_fd  = -1;
     int prev_output_fd = -1;
-    if ((prev_input_fd  = copy_dup2(0, input_fd))  == -1) { throw ExecutionException::ChangeInput;  }
-    if ((prev_output_fd = copy_dup2(1, output_fd)) == -1) { throw ExecutionException::ChangeOutput; }
+    if ((prev_input_fd  = copy_dup2(input_fd, 0))  == -1) { throw ExecutionException::ChangeInput;  }
+    if ((prev_output_fd = copy_dup2(output_fd, 1)) == -1) { throw ExecutionException::ChangeOutput; }
 
     pid_t process_id = fork(); // fork перед exec'ом.
     if (process_id == -1) { throw ExecutionException::Fork; }
@@ -56,6 +63,9 @@ void execute(const std::string& path, const std::vector<std::string>& args, int 
     }
     else // Ребёнок.
     {
+        // Закрытие переданного дополнительного файлового дескриптора со стороны дочернего процесса.
+        if (close_fd != -1) { close(close_fd); }
+
         // Подготовка массива аргументов.
         char** args_arr = new char*[args.size() + 1];
         for(size_t i = 0; i < args.size(); ++i)
@@ -69,11 +79,22 @@ void execute(const std::string& path, const std::vector<std::string>& args, int 
         if (execvp(path.c_str(), args_arr)) { throw ExecutionException::Execution; };
     }
 
-    return;
+    return process_id;
 }
+
+
 
 int main(int argc, char* argv[])
 {
+    enum class MainException
+    {
+        OK = 0,
+        Execution = 1,
+        Structure = 2,
+        Pipe      = 3,
+        File      = 4,
+    };
+
     // Модификаторы консоли.
     ANSI::Modifier text_modifier = ANSI::Modifier();
     ANSI::Modifier special_modifier = ANSI::Modifier(ANSI::Style::Bold, ANSI::Color::Foreground::BoldRed, ANSI::Color::Background::Reset);
@@ -87,43 +108,155 @@ int main(int argc, char* argv[])
         std::cout << special_modifier << std::getenv("PWD") << up_delimeter << text_modifier << std::flush;
         std::getline(std::cin, input);
 
-        // Конвертация строки в поток ввода.
-        std::stringstream input_stream(input, std::ios_base::in);
+        #ifdef DEBUG_INPUT
+        std::cout << input << std::endl;
+        #endif
 
-        do
+        // Массив введённых слов.
+        std::vector<std::string> words;
+
+        // Разбиение ввода на слова с учётом символов ' " '.
         {
-            // По договорённости, каждое первое слово в компоненте конвейера - команда.
-            std::string comand;
-            input_stream >> comand;
-
-            // Встроенные команды.
-            if (comand == "exit") { terminated = true; break; }
-            // Сторонние программы.
-            else
+            // Состояния ДКА.
+            enum class States
             {
+                Whitespace = 0,
+                Quoted     = 1,
+                Unquoted   = 2,
+            };
+            States state = States::Whitespace;
+            for (size_t i = 0; i < input.size(); ++i)
+            {
+                switch (state)
+                {
+                    case States::Whitespace:
+                    {
+                        switch (input[i])
+                        {
+                            case ' ':  { break; }
+                            case '\t': { break; }
+                            case '\"':
+                            {
+                                state = States::Quoted;
+                                words.push_back(""); // Встретился непустой символ - создаётся новое слово.
+                                break;
+                            }
+                            default:
+                            {
+                                state = States::Unquoted;
+                                words.push_back(""); // Встретился непустой символ - создаётся новое слово.
+                                break;
+                            }
+                        }
+                        break;
+                    }
+                    case States::Quoted:
+                    {
+                        switch (input[i])
+                        {
+                            case '\"': { state = States::Unquoted; break; }
+                            default:   { break; }
+                        }
+                        break;
+                    }
+                    case States::Unquoted:
+                    {
+                        switch (input[i])
+                        {
+                            case ' ':  { state = States::Whitespace; break; }
+                            case '\t': { state = States::Whitespace; break; }
+                            case '\"': { state = States::Quoted; break; }
+                            default:   { break; }
+                        }
+                        break;
+                    }
+                }
+
+                // Если символ не пустой, добавляем в слово.
+                if (state != States::Whitespace) { words[words.size() - 1].push_back(input[i]); }
+            }
+
+            #ifdef DEBUG_WORDS
+            std::cout << "Разобранные слова:" << std::endl;
+            for (size_t i = 0; i < words.size(); ++i) { std::cout << words[i] << std::endl; }
+            #endif
+        }
+
+        // Разбор введённых слов.
+        try
+        {
+            // Файловые дескрипторы для стандартного ввода и вывода запускаемых процессов.
+            int input_fd = 0;
+            int output_fd = 1;
+
+            std::vector<std::string> arguments;
+            for (size_t i = 0; i < words.size(); ++i)
+            {
+                // Здесь возможен запуск процесса.
                 try
                 {
-                    // Аргументы.
-                    std::vector<std::string> args(1);
-                    args[0] = comand; // Первый аргумент - имя команды.
-
-                    std::string next_arg;
-                    while (input_stream)
+                    if (words[i] == "|")
                     {
-                        args.push_back(next_arg);
-                        //std::cout << next_arg << std::endl;
+                        if (output_fd != 1) { throw MainException::Structure; } // Вывод уже переопределён.
+                        else
+                        {
+                            // Создание pipe'а.
+                            int pipefd[2];
+                            if (pipe(pipefd)) { throw MainException::Pipe; }
+
+                            // Перенаправление вывода от запускаемого процесса в pipe.
+                            output_fd = pipefd[1];
+
+                            // Запуск процесса.
+                            execute(arguments[0], arguments, input_fd, output_fd, pipefd[0]); // Запуск с закрытием ввода pipe'а со стороны дочернего процесса.
+                            close(output_fd);                                                 // Закрытие вывода pipe со стороны родителя.
+
+                            // Очистка аргументов.
+                            arguments.clear();
+
+                            // Перенаправление ввода/вывода для следующего процесса.
+                            input_fd = pipefd[0];
+                            output_fd = 1;
+                        }
                     }
+                    else if (words[i] == "<")
+                    {
+                        if (input_fd != 0) { throw MainException::Structure; } // Ввод уже переопределён.
+                        else
+                        {
+                            if ((i + 1 >= words.size()) || ( (input_fd = open(words[i + 1].c_str(), O_RDWR)) == -1 )) { throw MainException::File; }
+                            else { ++i; }
+                        }
+                    }
+                    else if (words[i] == ">")
+                    {
+                        if (output_fd != 1) { throw MainException::Structure; } // Вывод уже переопределён.
+                        else
+                        {
+                            if ((i + 1 >= words.size()) || ( (output_fd = open(words[i + 1].c_str(), O_RDWR | O_CREAT, 0666)) == -1)) { throw MainException::File; }
+                            else { ++i; }
+                        }
+                    }
+                    else { arguments.push_back(words[i]); }
 
-                    // Запуск.
-                    execute(comand, args, 0, 1);
+                    // Встроенные команды.
+                    if (arguments[0] == "exit") { terminated = true; break; }
+                    else if (i + 1 == words.size())
+                    {
+                        // Запуск процесса.
+                        execute(arguments[0], arguments, input_fd, output_fd);
 
-                    // Ожидание завершения.
-                    int status;
-                    wait(&status);
+                        // Очистка аргументов.
+                        arguments.clear();
+
+                        // Перенаправление ввода/вывода для следующего процесса.
+                        input_fd = 0;
+                        output_fd = 1;
+                    }
                 }
-                catch (const ExecutionException& Exception)
+                catch (const ExecutionException& exception)
                 {
-                    switch (Exception)
+                    switch (exception)
                     {
                         case ExecutionException::OK: { break; }
                         case ExecutionException::ChangeInput:
@@ -153,14 +286,40 @@ int main(int argc, char* argv[])
                         }
                         case ExecutionException::Execution:
                         {
-                            std::cerr << "Не удалось выполнить команду " << comand << std::endl;
+                            std::cerr << "Не удалось выполнить команду " << arguments[0] << std::endl;
                         }
                     }
-                    return 0;
+                    throw MainException::Execution;
                 }
             }
+
+            pid_t wpid = 0;
+            int status = 0;
+            while ((wpid = wait(&status)) > 0);
         }
-        while (input_stream);
+        catch (const MainException& exception)
+        {
+            switch (exception)
+            {
+                case MainException::OK: { break; }
+                case MainException::Execution: { break; }
+                case MainException::Structure:
+                {
+                    std::cerr << "Неверная структура команды." << std::endl;
+                    break;
+                }
+                case MainException::Pipe:
+                {
+                    std::cerr << "Ошибка при открытии pipe." << std::endl;
+                    break;
+                }
+                case MainException::File:
+                {
+                    std::cerr << "Ошибка при открытии файла." << std::endl;
+                }
+            }
+            return(0);
+        }
     }
     return 0;
 }
