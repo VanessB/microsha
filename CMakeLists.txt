@@ -15,5 +15,4 @@ add_executable(microsha ${SOURCES})
 set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -Wall -Wpedantic -Wextra -fexceptions -O0 -g3 -ggdb --std=c++17")
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -Wall -Wextra -O3 --std=c++17")
 
-# Математика.
-# target_link_libraries(FUPM2EMU m)
+target_link_libraries(microsha stdc++fs)

@@ -1,3 +1,5 @@
+#ifndef ANSI_HPP
+#define ANSI_HPP
 #include <ostream>
 
 namespace ANSI
@@ -95,3 +97,5 @@ namespace ANSI
 
     };
 }
+
+#endif

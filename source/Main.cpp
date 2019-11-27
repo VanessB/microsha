@@ -1,17 +1,26 @@
 #include <cinttypes>
+#include <iomanip>
 #include <iostream>
 #include <string>
 #include <vector>
 #include <cstring>
+#include <chrono>
+#include <filesystem>
+//#include <regex>
+#include <fnmatch.h>
 
 // Linux.
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/times.h>
 
 // Стили ANSI.
 #include "ANSI.hpp"
+
+// Отечественный аналог glob.
+#include "Matcher.hpp"
 
 //#define DEBUG_INPUT
 //#define DEBUG_WORDS
@@ -88,10 +97,61 @@ pid_t execute(const std::string& path, const std::vector<std::string>& args, int
     return process_id;
 }
 
+// Поиск файлов, подходящих под регулярное выражение.
+std::vector<std::string> match_files(std::string argument)
+{
+    std::vector<std::string> result;
+    if (!argument.size()) { result.push_back(argument); }
+    else
+    {
+        bool absolute = false;
+        int max_depth = 0;
+        for (size_t i = 0; i < argument.size(); ++i)
+        { if (argument[i] == '/') { ++max_depth; } }
+
+        std::filesystem::path walk_path;
+        if (argument[0] == '/')
+        {
+            absolute = true;
+            --max_depth;
+            walk_path = std::filesystem::path("/");
+        }
+        else
+        { walk_path = std::filesystem::current_path(); }
+
+        for (auto iterator = std::filesystem::recursive_directory_iterator(walk_path, std::filesystem::directory_options::skip_permission_denied);
+             iterator != std::filesystem::recursive_directory_iterator();
+             ++iterator )
+        //(auto& path: std::filesystem::directory_iterator(walk_path))
+        {
+            //std::cout << iterator.depth() << "\t" << iterator->path() << std::endl;
+            if (iterator.depth() > max_depth) { iterator.pop(); continue; }
+            //if (!iterator->is_regular_file()) { continue; }
+            if (absolute)
+            {
+                if (fnmatch(argument.c_str(), iterator->path().c_str(), FNM_PATHNAME) == 0)
+                { result.push_back(iterator->path().string()); }
+            }
+            else
+            {
+                if (fnmatch((walk_path.string() + "/" + argument).c_str(), iterator->path().c_str(), FNM_PATHNAME) == 0)
+                { result.push_back(iterator->path().string()); }
+            }
+        }
+    }
+
+    //for (auto i : result)
+    //{
+    //    std::cout << i << std::endl;
+    //}
+    return result;
+}
+
 
 
 int main(int argc, char* argv[])
 {
+    // Коды основных исключений.
     enum class MainException
     {
         OK        = 0,
@@ -126,6 +186,11 @@ int main(int argc, char* argv[])
             #ifdef DEBUG_INPUT
             std::cout << input << std::endl;
             #endif
+
+            // Переменные для измерения времени выполнения.
+            bool time = false;
+            tms times_first;
+            std::chrono::time_point<std::chrono::system_clock> real_time_first;
 
             // Массив введённых слов.
             std::vector<std::string> words;
@@ -252,8 +317,18 @@ int main(int argc, char* argv[])
                 int input_fd = 0;
                 int output_fd = 1;
 
+                // Обработка команды time.
+                size_t i = 0;
+                if (words.size() > 0 && words[0] == "time")
+                {
+                    time = true;
+                    i = 1;
+                    times(&times_first);
+                    real_time_first = std::chrono::system_clock::now();
+                }
+
                 std::vector<std::string> arguments;
-                for (size_t i = 0; i < words.size(); ++i)
+                for (; i < words.size(); ++i)
                 {
                     // Здесь возможен запуск процесса.
                     try
@@ -300,7 +375,20 @@ int main(int argc, char* argv[])
                                 else { ++i; }
                             }
                         }
-                        else { arguments.push_back(words[i]); }
+                        else
+                        {
+                            // Matcher::Matcher matcher(words[i]);
+                            // while (matcher)
+                            // {
+                            //     std::cout << matcher.current_match() << std::endl;
+                            //     matcher.next();
+                            // }
+                            std::vector<std::string> matched = match_files(words[i]);
+                            if(matched.empty())
+                            { arguments.push_back(words[i]); }
+                            else
+                            { arguments.insert(arguments.end(), matched.begin(), matched.end()); }
+                        }
 
                         if (i + 1 == words.size())
                         {
@@ -348,6 +436,7 @@ int main(int argc, char* argv[])
                             case ExecutionException::Execution:
                             {
                                 std::cerr << "Не удалось выполнить команду " << arguments[0] << std::endl;
+                                break;
                             }
                         }
                         throw MainException::Execution;
@@ -357,6 +446,19 @@ int main(int argc, char* argv[])
                 pid_t wpid = 0;
                 int status = 0;
                 while ((wpid = wait(&status)) > 0);
+
+                // Вывод времени работы детей.
+                if (time)
+                {
+                    tms times_second;
+                    times(&times_second);
+                    auto real_time_second = std::chrono::system_clock::now();
+                    std::cout << std::fixed << std::setprecision(3) << std::endl
+                              << "real:\t" << std::chrono::duration<double>(real_time_second - real_time_first).count() << "ms" << std::endl
+                              << "user:\t" << 1000.0 * (times_second.tms_cutime - times_first.tms_cutime) / CLOCKS_PER_SEC << "ms" << std::endl
+                              << "sys:\t"  << 1000.0 * (times_second.tms_cstime - times_first.tms_cstime) / CLOCKS_PER_SEC << "ms" << std::endl
+                              << std::defaultfloat;
+                }
             }
         }
         catch (const MainException& exception)
@@ -386,7 +488,7 @@ int main(int argc, char* argv[])
                     break;
                 }
             }
-            return(0);
+            return 0;
         }
     }
 
