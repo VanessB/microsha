@@ -12,15 +12,13 @@
 // Linux.
 #include <unistd.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/times.h>
 
 // Стили ANSI.
 #include "ANSI.hpp"
-
-// Отечественный аналог glob.
-#include "Matcher.hpp"
 
 //#define DEBUG_INPUT
 //#define DEBUG_WORDS
@@ -30,6 +28,7 @@
 // Строки-разделители для непривилегированного и привилигерованнонного пользователя.
 const std::string up_delimeter = " ☭ ";
 const std::string p_delimeter  = "! ";
+
 
 // Копирующая вариация dup2.
 inline int copy_dup2(int oldfd, int newfd)
@@ -90,12 +89,22 @@ pid_t execute(const std::string& path, const std::vector<std::string>& args, int
         std::cout << "PWD: " << std::getenv("PWD") << std::endl;
         #endif
 
+        // Стандартная обработка сигналов.
+        signal(SIGINT, SIG_DFL);
+
         // Запуск.
-        if (execvp(path.c_str(), args_arr)) { throw ExecutionException::Execution; };
+        if (execvp(path.c_str(), args_arr))
+        {
+            for(size_t i = 0; i < args.size(); ++i)
+            { delete[] args_arr[i]; }
+            delete[] args_arr;
+            throw ExecutionException::Execution;
+        }
     }
 
     return process_id;
 }
+
 
 // Поиск файлов, подходящих под регулярное выражение.
 std::vector<std::string> match_files(std::string argument)
@@ -122,9 +131,7 @@ std::vector<std::string> match_files(std::string argument)
         for (auto iterator = std::filesystem::recursive_directory_iterator(walk_path, std::filesystem::directory_options::skip_permission_denied);
              iterator != std::filesystem::recursive_directory_iterator();
              ++iterator )
-        //(auto& path: std::filesystem::directory_iterator(walk_path))
         {
-            //std::cout << iterator.depth() << "\t" << iterator->path() << std::endl;
             if (iterator.depth() > max_depth) { iterator.pop(); continue; }
             //if (!iterator->is_regular_file()) { continue; }
             if (absolute)
@@ -140,10 +147,6 @@ std::vector<std::string> match_files(std::string argument)
         }
     }
 
-    //for (auto i : result)
-    //{
-    //    std::cout << i << std::endl;
-    //}
     return result;
 }
 
@@ -180,8 +183,16 @@ int main(int argc, char* argv[])
                 char* ptr = get_current_dir_name();
                 if (ptr == nullptr) { throw MainException::Env; }
                 std::cout << special_modifier << ptr << (user_id == 0 ? p_delimeter : up_delimeter) << text_modifier << std::flush;
+                free(ptr);
             }
             std::getline(std::cin, input);
+
+            // Завершение при пустом вводе.
+            //if (input.empty())
+            //{
+            //    std::cout << std::endl;
+            //    return 0;
+            //}
 
             #ifdef DEBUG_INPUT
             std::cout << input << std::endl;
@@ -253,7 +264,7 @@ int main(int argc, char* argv[])
                     }
 
                     // Если символ не пустой, добавляем в слово.
-                    if (state != States::Whitespace) { words[words.size() - 1].push_back(input[i]); }
+                    if ((state != States::Whitespace) && (input[i] != '\"')) { words[words.size() - 1].push_back(input[i]); }
                 }
 
                 #ifdef DEBUG_WORDS
@@ -261,6 +272,9 @@ int main(int argc, char* argv[])
                 for (size_t i = 0; i < words.size(); ++i) { std::cout << words[i] << std::endl; }
                 #endif
             }
+
+            // Пустой ввод.
+            if (words.empty()) { throw MainException::Structure; }
 
             // Разбор введённых слов.
             // Сначала обработка встроенных команд.
@@ -275,34 +289,35 @@ int main(int argc, char* argv[])
             else if (words[0] == "set")
             {
                 // Ищем разделитель - знак "=".
-                size_t position = 0; // Положение разделителя.
-                if ((words.size() < 2) || ((position = words[1].find("=")) == std::string::npos)) { throw MainException::Structure; }
+                size_t delimeter_position = 0; // Положение разделителя.
+                if ((words.size() < 2) || ((delimeter_position = words[1].find("=")) == std::string::npos)) { throw MainException::Structure; }
                 size_t size = words[1].size();
 
-                // Обработка двойных кавычек.
-                //std::cout << words[1][position + 1] << "  " << words[1][size - 1] << std::endl;
-                size_t value_start = position + 1; // Положение первого символа значения переменной.
-                if ((size - position > 1) && (words[1][position + 1] == '\"') && (words[1][size - 1] == '\"'))
+                // Положения и длины требуемых подстрок.
+                size_t name_position  = 0;
+                size_t name_length    = delimeter_position;
+                size_t value_position = delimeter_position + 1;
+                size_t value_length   = size - value_position;
+
+                // Обработка кавычек.
+                #ifdef DEBUG_ENV
+                std::cout << variable << " = " << value << std::endl;
+                std::cout << "value_position: " << value_position << ": " << words[1][value_position] << "  "
+                          << "value_position + value_lenth - 1: " << value_position + value_length << ": " << words[1][value_position + value_length - 1] << std::endl;
+                #endif
+                if ((value_length > 1) && (words[1][value_position] == '\"') && (words[1][value_position + value_length - 1] == '\"'))
                 {
-                    ++value_start;
-                    --size;
+                    ++value_position;
+                    value_length -= 2;
                 }
 
-                // Чёртов c-style...
-                char* variable_c_str = new char[position + 1];
-                char* value_c_str = new char[size - value_start + 1];
-                memcpy(variable_c_str, words[1].c_str(), position);
-                variable_c_str[position] = 0;
-                memcpy(value_c_str, words[1].c_str() + value_start, size - value_start);
-                value_c_str[size - position] = 0;
+                std::string variable = words[1].substr(name_position, name_length);
+                std::string value = words[1].substr(value_position, value_length);
 
                 #ifdef DEBUG_ENV
-                std::cout << variable_c_str << " = " << value_c_str << std::endl;
+                std::cout << variable << " = " << value << std::endl;
                 #endif
-                setenv(variable_c_str, value_c_str, 1);
-
-                delete[] value_c_str;
-                delete[] variable_c_str;
+                setenv(variable.c_str(), value.c_str(), 1);
             }
             else if (words[0] == "get")
             {
@@ -349,6 +364,9 @@ int main(int argc, char* argv[])
                                 execute(arguments[0], arguments, input_fd, output_fd, pipefd[0]); // Запуск с закрытием ввода pipe'а со стороны дочернего процесса.
                                 close(output_fd);                                                 // Закрытие вывода pipe со стороны родителя.
 
+                                // Обработка входного конца pipe.
+                                if (input_fd != 0) { close(input_fd); }
+
                                 // Очистка аргументов.
                                 arguments.clear();
 
@@ -377,23 +395,29 @@ int main(int argc, char* argv[])
                         }
                         else
                         {
-                            // Matcher::Matcher matcher(words[i]);
-                            // while (matcher)
-                            // {
-                            //     std::cout << matcher.current_match() << std::endl;
-                            //     matcher.next();
-                            // }
-                            std::vector<std::string> matched = match_files(words[i]);
-                            if(matched.empty())
-                            { arguments.push_back(words[i]); }
+                            // Если список аргументов пустой, первый аргумент - имя исполняемой команды, передаётся неизменным.
+                            if (arguments.empty())
+                            {
+                                arguments.push_back(words[i]);
+                            }
+                            // Иначе, производится поиск подходящих под регулярное выражение аргументов.
                             else
-                            { arguments.insert(arguments.end(), matched.begin(), matched.end()); }
+                            {
+                                std::vector<std::string> matched = match_files(words[i]);
+                                if (matched.empty())
+                                { arguments.push_back(words[i]); }
+                                else
+                                { arguments.insert(arguments.end(), matched.begin(), matched.end()); }
+                            }
                         }
 
                         if (i + 1 == words.size())
                         {
                             // Запуск процесса.
                             execute(arguments[0], arguments, input_fd, output_fd);
+
+                            // Обработка входного конца pipe.
+                            if (input_fd != 0) { close(input_fd); }
 
                             // Очистка аргументов.
                             arguments.clear();
@@ -443,9 +467,16 @@ int main(int argc, char* argv[])
                     }
                 }
 
+                // Игнорирование сигнала прерывания.
+                signal(SIGINT, SIG_IGN);
+
+                // Ожидание порождённых процессов.
                 pid_t wpid = 0;
                 int status = 0;
                 while ((wpid = wait(&status)) > 0);
+
+                // Стандартная обработка сигналов.
+                signal(SIGINT, SIG_DFL);
 
                 // Вывод времени работы детей.
                 if (time)
