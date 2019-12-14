@@ -7,9 +7,9 @@
 #include <chrono>
 #include <filesystem>
 //#include <regex>
-#include <fnmatch.h>
 
 // Linux.
+#include <fnmatch.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -24,6 +24,7 @@
 //#define DEBUG_WORDS
 //#define DEBUG_ENV
 //#define DEBUG_EXECUTE
+//#define DEBUG_MATCH_FILES
 
 // Строки-разделители для непривилегированного и привилигерованнонного пользователя.
 const std::string up_delimeter = " ☭ ";
@@ -107,42 +108,68 @@ pid_t execute(const std::string& path, const std::vector<std::string>& args, int
 
 
 // Поиск файлов, подходящих под регулярное выражение.
-std::vector<std::string> match_files(std::string argument)
+std::vector<std::filesystem::path> match_files(std::string pattern, std::filesystem::path root)
 {
-    std::vector<std::string> result;
-    if (!argument.size()) { result.push_back(argument); }
+    // Нормализация путей.
+    pattern = std::filesystem::path(pattern).lexically_normal();
+    root = root.lexically_normal();
+
+    #ifdef DEBUG_MATCH_FILES
+    std::cout << "Образец: " << pattern << " : " << "Корень: " << root << std::endl;
+    #endif
+
+    // Удаление граничных слешей.
+    if (pattern[0] == '/') { pattern.erase(pattern.begin() + 0); }
+    if (pattern[pattern.size() - 1] == '/') { pattern.erase(pattern.end()); }
+
+    #ifdef DEBUG_MATCH_FILES
+    std::cout << "Образец: " << pattern << " : " << "Корень: " << root << std::endl;
+    #endif
+
+    // Получение левой компоненты образца.
+    size_t position = pattern.find("/");
+
+    // Массив результатов поиска.
+    std::vector<std::filesystem::path> result;
+
+    // Обход директорий.
+    if ((position == std::string::npos) || (position == pattern.size() - 1))
+    {
+        // Только файлы.
+        for (auto iterator = std::filesystem::directory_iterator(root, std::filesystem::directory_options::skip_permission_denied); iterator != std::filesystem::directory_iterator(); ++iterator)
+        {
+            #ifdef DEBUG_MATCH_FILES
+            std::cout << iterator->path().filename() << std::endl;
+            #endif
+
+            if (fnmatch(pattern.c_str(), iterator->path().filename().c_str(), FNM_PATHNAME) == 0)
+            { result.push_back((root / iterator->path().filename()).lexically_normal()); }
+        }
+    }
     else
     {
-        bool absolute = false;
-        int max_depth = 0;
-        for (size_t i = 0; i < argument.size(); ++i)
-        { if (argument[i] == '/') { ++max_depth; } }
-
-        std::filesystem::path walk_path;
-        if (argument[0] == '/')
-        {
-            absolute = true;
-            --max_depth;
-            walk_path = std::filesystem::path("/");
-        }
+        std::string substring = pattern.substr(0, position);
+        std::string new_pattern = pattern.substr(position + 1, pattern.size() - position - 1);
+        #ifdef DEBUG_MATCH_FILES
+        std::cout << "Разбивка: " << substring << " : " << new_pattern << std::endl;
+        #endif
+        if (substring == "..")
+        { result = match_files(new_pattern, root / ".."); }
         else
-        { walk_path = std::filesystem::current_path(); }
-
-        for (auto iterator = std::filesystem::recursive_directory_iterator(walk_path, std::filesystem::directory_options::skip_permission_denied);
-             iterator != std::filesystem::recursive_directory_iterator();
-             ++iterator )
         {
-            if (iterator.depth() > max_depth) { iterator.pop(); continue; }
-            //if (!iterator->is_regular_file()) { continue; }
-            if (absolute)
+            for (auto iterator = std::filesystem::directory_iterator(root, std::filesystem::directory_options::skip_permission_denied); iterator != std::filesystem::directory_iterator(); ++iterator)
             {
-                if (fnmatch(argument.c_str(), iterator->path().c_str(), FNM_PATHNAME) == 0)
-                { result.push_back(iterator->path().string()); }
-            }
-            else
-            {
-                if (fnmatch((walk_path.string() + "/" + argument).c_str(), iterator->path().c_str(), FNM_PATHNAME) == 0)
-                { result.push_back(iterator->path().string()); }
+                if (!iterator->is_directory()) { continue; }
+
+                #ifdef DEBUG_MATCH_FILES
+                std::cout << iterator->path().filename() << std::endl;
+                #endif
+
+                if (fnmatch(substring.c_str(), iterator->path().filename().c_str(), FNM_PATHNAME) == 0)
+                {
+                    std::vector<std::filesystem::path> matched = match_files(new_pattern, root / iterator->path().filename());
+                    result.insert(result.end(), matched.begin(), matched.end());
+                }
             }
         }
     }
@@ -185,14 +212,11 @@ int main(int argc, char* argv[])
                 std::cout << special_modifier << ptr << (user_id == 0 ? p_delimeter : up_delimeter) << text_modifier << std::flush;
                 free(ptr);
             }
-            std::getline(std::cin, input);
-
-            // Завершение при пустом вводе.
-            //if (input.empty())
-            //{
-            //    std::cout << std::endl;
-            //    return 0;
-            //}
+            if (!std::getline(std::cin, input))
+            {
+                std::cout << std::endl;
+                return 0;
+            }
 
             #ifdef DEBUG_INPUT
             std::cout << input << std::endl;
@@ -264,7 +288,9 @@ int main(int argc, char* argv[])
                     }
 
                     // Если символ не пустой, добавляем в слово.
-                    if ((state != States::Whitespace) && (input[i] != '\"')) { words[words.size() - 1].push_back(input[i]); }
+                    //if ((state != States::Whitespace) && (input[i] != '\"'))
+                    if (state != States::Whitespace)
+                    { words[words.size() - 1].push_back(input[i]); }
                 }
 
                 #ifdef DEBUG_WORDS
@@ -274,7 +300,7 @@ int main(int argc, char* argv[])
             }
 
             // Пустой ввод.
-            if (words.empty()) { throw MainException::Structure; }
+            if (words.empty()) { continue; }
 
             // Разбор введённых слов.
             // Сначала обработка встроенных команд.
@@ -400,14 +426,37 @@ int main(int argc, char* argv[])
                             {
                                 arguments.push_back(words[i]);
                             }
-                            // Иначе, производится поиск подходящих под регулярное выражение аргументов.
+                            // Иначе, проверка на переменную среды. Если не переменная среды, производится поиск подходящих под регулярное выражение аргументов.
                             else
                             {
-                                std::vector<std::string> matched = match_files(words[i]);
-                                if (matched.empty())
-                                { arguments.push_back(words[i]); }
+                                // Чистка слова от двойных кавычек.
+                                // TODO: убрать этот костыль.
+                                std::string cleaned;
+                                cleaned.reserve(words[i].size());
+                                for(size_t j = 0; j < words[i].size(); ++j)
+                                { if(words[i][j] != '\"') cleaned += words[i][j]; }
+
+                                // Переменная среды.
+                                if (words[i][0] == '$')
+                                {
+                                    // Получение имени переменной.
+                                    std::string variable_name = cleaned.substr(1, cleaned.size() - 1);
+
+                                    // Получение значения переменной.
+                                    char* ptr = std::getenv(variable_name.c_str());
+                                    if (ptr == nullptr) { throw MainException::Env; }
+
+                                    // Запись значения.
+                                    arguments.push_back(std::string(ptr));
+                                }
                                 else
-                                { arguments.insert(arguments.end(), matched.begin(), matched.end()); }
+                                {
+                                    std::vector<std::filesystem::path> matched = (cleaned[0] == '/') ? match_files(cleaned, "/") : match_files(cleaned, "./");
+                                    if (matched.empty())
+                                    { arguments.push_back(cleaned); }
+                                    else
+                                    { arguments.insert(arguments.end(), matched.begin(), matched.end()); }
+                                }
                             }
                         }
 
@@ -416,8 +465,9 @@ int main(int argc, char* argv[])
                             // Запуск процесса.
                             execute(arguments[0], arguments, input_fd, output_fd);
 
-                            // Обработка входного конца pipe.
-                            if (input_fd != 0) { close(input_fd); }
+                            // Обработка нестандартных файловых дискрипторов.
+                            if (input_fd != 0)  { close(input_fd); }
+                            if (output_fd != 1) { close(output_fd); }
 
                             // Очистка аргументов.
                             arguments.clear();
