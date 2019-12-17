@@ -1,4 +1,5 @@
 #include <cinttypes>
+#include <cctype>
 #include <iomanip>
 #include <iostream>
 #include <string>
@@ -9,6 +10,7 @@
 //#include <regex>
 
 // Linux.
+#include <termios.h>
 #include <fnmatch.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -25,6 +27,7 @@
 //#define DEBUG_ENV
 //#define DEBUG_EXECUTE
 //#define DEBUG_MATCH_FILES
+//#define DEBUG_KEYCODES
 
 // Строки-разделители для непривилегированного и привилигерованнонного пользователя.
 const std::string up_delimeter = " ☭ ";
@@ -196,6 +199,38 @@ int main(int argc, char* argv[])
     ANSI::Modifier text_modifier = ANSI::Modifier();
     ANSI::Modifier special_modifier = ANSI::Modifier(ANSI::Style::Bold, ANSI::Color::Foreground::BoldRed, ANSI::Color::Background::Reset);
 
+    // RAII-обёртка для модификации терминала.
+    class TermiosSection
+    {
+    public:
+        TermiosSection()
+        {
+            // Получение текущих аттрибутов.
+            tcgetattr(STDIN_FILENO, &termios_old);
+            termios_new = termios_old;
+
+            // ICANON обычно означает, что вход обрабатывается построчно.
+            // Это означает, что возврат происходит по "\n" или EOF или EOL
+            termios_new.c_lflag &= ~(ICANON | ECHO);
+
+            // Новые настройки применяются к STDIN.
+            // TCSANOW говорит tcsetattr изменить атрибуты небедленно.
+            tcsetattr(STDIN_FILENO, TCSANOW, &termios_new);
+        };
+        ~TermiosSection()
+        {
+            // Восстановление настроек терминала.
+            tcsetattr(STDIN_FILENO, TCSANOW, &termios_old);
+        }
+
+    protected:
+        termios termios_old;
+        termios termios_new;
+    };
+
+    // История команд.
+    std::vector<std::string> history;
+
     // Основной цикл работы.
     bool terminated = false;
     while (!terminated)
@@ -204,18 +239,170 @@ int main(int argc, char* argv[])
         {
             pid_t user_id = getuid(); // Получение ID пользователя.
 
-            // Приглашение к вводу и получение введённой строки.
-            std::string input;
+            // Приглашение ко вводу.
+            std::string info;
             {
                 char* ptr = get_current_dir_name();
                 if (ptr == nullptr) { throw MainException::Env; }
-                std::cout << special_modifier << ptr << (user_id == 0 ? p_delimeter : up_delimeter) << text_modifier << std::flush;
+                info = special_modifier.string() + std::string(ptr) + (user_id == 0 ? p_delimeter : up_delimeter) + text_modifier.string();
                 free(ptr);
             }
-            if (!std::getline(std::cin, input))
+
+            // Получение введённой команды.
+            std::string input;
             {
-                std::cout << std::endl;
-                return 0;
+                // Позиции курсоров.
+                size_t history_pos = history.size(); // Текущая команда из истории.
+                size_t cursor_pos  = 0;              // Положение курсора.
+
+                // Перенастройка терминала в специальный режим.
+                TermiosSection termios_section;
+
+                // Цикл обработки ввода.
+                while (true)
+                {
+                    // Текущий вид команды:
+                    std::string& echo = ((history_pos == history.size()) ? input : history[history_pos]);
+                    std::cout << "\33[2K\r" << info << echo;
+                    for (size_t i = echo.size(); i > cursor_pos; --i) { std::cout << "\b"; }
+
+                    // Получение нажатой клавиши.
+                    int key = getchar();
+
+                    #ifdef DEBUG_KEYCODES
+                    std::cout << std::endl << key << std::endl;
+                    #endif
+
+                    // Обработка специальных кодов.
+                    // Ctrl + D
+                    if (key == 4)
+                    {
+                        std::cout << std::endl;
+                        return 0;
+                    }
+
+                    if (key == 27)
+                    {
+                        switch (getchar())
+                        {
+                            case 91:
+                            {
+                                switch (getchar())
+                                {
+                                    // Стрелки.
+                                    // Вверх
+                                    case 'A':
+                                    {
+                                        if (history.empty()) { break; }
+                                        if (history_pos > 0)
+                                        {
+                                            --history_pos;
+                                            cursor_pos = history[history_pos].size();
+                                        }
+                                        break;
+                                    }
+                                    // Вниз.
+                                    case 'B':
+                                    {
+                                        //if (history.empty()) { break; }
+                                        if (history_pos < history.size())
+                                        {
+                                            ++history_pos;
+                                            cursor_pos = ((history_pos == history.size()) ? input.size() : history[history_pos].size());
+                                        }
+                                        break;
+                                    }
+                                    // Вправо.
+                                    case 'C':
+                                    {
+                                        size_t max_pos = echo.size();
+                                        if (cursor_pos < max_pos)
+                                        { ++cursor_pos; }
+                                        break;
+                                    }
+                                    // Влево.
+                                    case 'D':
+                                    {
+                                        if (cursor_pos > 0)
+                                        { --cursor_pos; }
+                                        break;
+                                    }
+
+                                    // Другое.
+                                    case 51:
+                                    {
+                                        switch (getchar())
+                                        {
+                                            // Delete.
+                                            case 126:
+                                            {
+                                                // Если при вводе обычного символа выбрана команда из истории, обновляем введённую строку.
+                                                if (history_pos != history.size())
+                                                {
+                                                    input = history[history_pos];
+                                                    history_pos = history.size();
+                                                }
+
+                                                // Удаление символа после курсора.
+                                                if (cursor_pos < input.size())
+                                                {
+                                                    input.erase(cursor_pos, 1);
+                                                }
+                                                break;
+                                            }
+                                            default: { break; }
+                                        }
+                                        break;
+                                    }
+                                    default: { break; }
+                                }
+                                break;
+                            }
+                            default: { break; }
+                        }
+
+                        // Дальнейшая прослушка ввода.
+                        continue;
+                    }
+
+                    // Если при вводе обычного символа выбрана команда из истории, обновляем введённую строку.
+                    if (history_pos != history.size())
+                    {
+                        input = history[history_pos];
+                        history_pos = history.size();
+                    }
+
+                    // Оконсание ввода.
+                    if (key == '\n')
+                    {
+                        std::cout << std::endl;
+                        // Если команда не пустая и не совпадает с последней командой из истории, происходит её запоминание.
+                        if (!input.empty() && (history.empty() || (input != history[history.size() - 1]))) { history.push_back(input); }
+                        break;
+                    }
+
+                    // Backspace
+                    if (key == 127)
+                    {
+                        // Удаление символа до курсора.
+                        if (!input.empty() && (cursor_pos > 0))
+                        {
+                            input.erase(cursor_pos - 1, 1);
+                            --cursor_pos;
+                        }
+                        continue;
+                    }
+
+                    // Обычные символы.
+                    if (key >= 32)
+                    {
+                        if (cursor_pos == input.size())
+                        { input.push_back(key); }
+                        else
+                        { input.insert(input.begin() + cursor_pos, key); }
+                        ++cursor_pos;
+                    }
+                }
             }
 
             #ifdef DEBUG_INPUT
@@ -434,7 +621,7 @@ int main(int argc, char* argv[])
                                 std::string cleaned;
                                 cleaned.reserve(words[i].size());
                                 for(size_t j = 0; j < words[i].size(); ++j)
-                                { if(words[i][j] != '\"') cleaned += words[i][j]; }
+                                { if(words[i][j] != '\"') { cleaned += words[i][j]; } }
 
                                 // Переменная среды.
                                 if (words[i][0] == '$')
@@ -547,7 +734,7 @@ int main(int argc, char* argv[])
             switch (exception)
             {
                 case MainException::OK: { break; }
-                case MainException::Execution: { break; }
+                case MainException::Execution: { return 0; break; }
                 case MainException::Structure:
                 {
                     std::cerr << "Неверная структура команды." << std::endl;
@@ -569,7 +756,7 @@ int main(int argc, char* argv[])
                     break;
                 }
             }
-            return 0;
+            //return 0;
         }
     }
 

@@ -91,6 +91,13 @@ namespace ANSI
                       << "\033[" << static_cast<int>(mod.background) << "m";
         }
 
+        std::string string()
+        {
+            return "\033[" + std::to_string(static_cast<int>(style)) + "m"
+            + "\033[" + std::to_string(static_cast<int>(foreground)) + "m"
+            + "\033[" + std::to_string(static_cast<int>(background)) + "m";
+        }
+
     protected:
 
     private:
